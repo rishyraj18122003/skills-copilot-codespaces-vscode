@@ -1,0 +1,128 @@
+name: KB Freeze v1
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build KB freeze
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install "sentence-transformers==3.0.1" "huggingface-hub>=0.24,<1" "numpy<3"
+          git clone --quiet --no-tags --filter=blob:none https://github.com/MicrosoftDocs/SupportArticles-docs.git src_repo
+          git -C src_repo checkout --quiet 899bff3bc0ce59244c9258bd55bdddbf2d94a705
+
+          python - <<'PY'
+          from pathlib import Path
+          import csv, hashlib, json, re
+          from sentence_transformers import SentenceTransformer
+
+          repo=Path("src_repo")
+          roots={"Windows":Path("support/windows-client"),"Outlook":Path("Outlook"),"Teams":Path("Teams"),"Microsoft365":Path("Microsoft365")}
+          include=re.compile(r"(troubleshoot|troubleshooting|error|issue|problem|cannot|can't|unable|missing|fails?|failure|not[- ]working|sync|sign[- ]in|login|password|attachment|recording|search|crash|freeze|hang|connect)",re.I)
+          exclude=re.compile(r"(^|/)(admin|developer|dev|authoring|templates?)(/|$)|(toc|index)[^/]*\\.md$",re.I)
+
+          def front(text):
+              if not text.startswith("---"): return {},text
+              a=text.split("---",2)
+              if len(a)!=3: return {},text
+              m={}
+              for line in a[1].splitlines():
+                  if ":" in line and not line.startswith((" ","-")):
+                      k,v=line.split(":",1); m[k.strip()]=v.strip().strip('"')
+              return m,a[2]
+
+          def clean(x):
+              x=re.sub(r"<!--.*?-->","",x,flags=re.S)
+              x=re.sub(r":::\\w+.*?(?=\\n|$)","",x)
+              return re.sub(r"\\n{3,}","\\n\\n",x).strip()
+
+          candidates={k:[] for k in roots}
+          seen=set()
+          raw_counts={}
+          for fam,root in roots.items():
+              files=[p for p in (repo/root).rglob("*.md") if p.is_file()] if (repo/root).exists() else []
+              raw_counts[fam]=len(files)
+              for p in files:
+                  rel=p.relative_to(repo)
+                  if p.name.lower() in {"index.md","toc.md"} or exclude.search(rel.as_posix()): continue
+                  meta,body=front(p.read_text(encoding="utf-8",errors="replace")); body=clean(body)
+                  if len(body)<300: continue
+                  title=meta.get("title","").strip(); desc=meta.get("description","").strip(); topic=meta.get("ms.topic","").strip().lower()
+                  if topic!="troubleshooting" and not include.search(title+" "+desc+" "+body[:2000]): continue
+                  h=hashlib.sha256(body.encode()).hexdigest()
+                  if h in seen: continue
+                  seen.add(h)
+                  candidates[fam].append({"path":rel.as_posix(),"title":title,"description":desc,"topic":topic,"audience":meta.get("audience",""),"ms_date":meta.get("ms.date",""),"content":body,"hash":h})
+
+          total=200
+          denom=sum(raw_counts.values())
+          quotas={k:(total*v)//denom for k,v in raw_counts.items()}
+          for k in sorted(raw_counts, key=lambda z:(-(total*raw_counts[z]/denom-quotas[z]),z)):
+              if sum(quotas.values())<total: quotas[k]+=1
+
+          selected=[]
+          for fam,items in candidates.items():
+              items.sort(key=lambda x:(-(10 if x["topic"]=="troubleshooting" else 0)-(5 if include.search(x["title"]) else 0)-(3 if include.search(x["description"]) else 0),x["path"]))
+              selected += [{**x,"product_family":fam} for x in items[:quotas[fam]]]
+          selected=selected[:total]
+          selected.sort(key=lambda x:(x["product_family"],x["path"]))
+
+          out=Path("kb_freeze"); content_dir=out/"kb_content"; content_dir.mkdir(parents=True,exist_ok=True)
+          articles=[]; units=[]
+          for x in selected:
+              kid="KB-"+hashlib.sha1(x["path"].encode()).hexdigest()[:12].upper()
+              articles.append({"kb_id":kid,"source_path":x["path"],"source_url":f"https://github.com/MicrosoftDocs/SupportArticles-docs/blob/899bff3bc0ce59244c9258bd55bdddbf2d94a705/{x['path']}","title":x["title"],"description":x["description"],"product_family":x["product_family"],"topic":x["topic"],"audience":x["audience"],"ms_date":x["ms_date"],"content_sha256":x["hash"],"source_snapshot":"899bff3bc0ce59244c9258bd55bdddbf2d94a705","selection_status":"included"})
+              words=x["content"].split(); start=0; n=1
+              while start<len(words):
+                  end=min(start+180,len(words)); chunk=" ".join(words[start:end]); uid=f"{kid}-C{n:03d}"; txt=f"{x['title']}\\n{chunk}"
+                  units.append((uid,kid,x["product_family"],x["path"],n,txt))
+                  (content_dir/f"{uid}.txt").write_text(chunk,encoding="utf-8")
+                  n+=1
+                  if end==len(words): break
+                  start=max(0,end-30)
+
+          fields=["kb_id","source_path","source_url","title","description","product_family","topic","audience","ms_date","content_sha256","source_snapshot","selection_status"]
+          with (out/"kb_articles_frozen.csv").open("w",newline="",encoding="utf-8") as f:
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(articles)
+          uf=["unit_id","kb_id","product_family","source_path","chunk_no","retrieval_text_sha256","text_word_count","retrieval_text"]
+          with (out/"kb_units.csv").open("w",newline="",encoding="utf-8") as f:
+              w=csv.DictWriter(f,fieldnames=uf); w.writeheader(); w.writerows({"unit_id":u[0],"kb_id":u[1],"product_family":u[2],"source_path":u[3],"chunk_no":u[4],"retrieval_text_sha256":hashlib.sha256(u[5].encode()).hexdigest(),"text_word_count":len(u[5].split()),"retrieval_text":u[5]} for u in units)
+
+          model=SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+          model.max_seq_length=256
+          emb=model.encode([u[5] for u in units],batch_size=64,show_progress_bar=True,convert_to_numpy=True,normalize_embeddings=True)
+          import numpy as np
+          np.save(out/"kb_embeddings_minilm.npy",emb.astype("float32"))
+          model_hash=hashlib.sha256((Path(model._modules["0"].auto_model.config._name_or_path) if False else Path.home()).as_posix().encode()).hexdigest()
+          manifest={"source_repository":"MicrosoftDocs/SupportArticles-docs","source_commit":"899bff3bc0ce59244c9258bd55bdddbf2d94a705","article_count":len(articles),"unit_count":len(units),"raw_article_counts_by_family":raw_counts,"quota_by_family":quotas,"retriever":"sentence-transformers/all-MiniLM-L6-v2","max_seq_length":256,"pooling":"mean","normalized":True,"similarity":"cosine"}
+          (out/"kb_manifest.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
+          qa={"article_count":len(articles),"unit_count":len(units),"unique_content_hashes":len({a["content_sha256"] for a in articles}),"duplicate_article_count":0}
+          (out/"kb_qa.json").write_text(json.dumps(qa,indent=2),encoding="utf-8")
+          PY
+
+          tar -czf kb_freeze_artifact.tar.gz kb_freeze
+          sha256sum kb_freeze_artifact.tar.gz > kb_freeze_artifact.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kb-freeze-v1
+          path: |
+            kb_freeze_artifact.tar.gz
+            kb_freeze_artifact.sha256
+            kb_freeze/kb_manifest.json
+            kb_freeze/kb_qa.json
