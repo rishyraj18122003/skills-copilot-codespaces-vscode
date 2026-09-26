@@ -1,0 +1,13 @@
+pool,from_tag,to_tag,count
+train,non_resolution,technician_only,8
+train,non_resolution,user_actionable,71
+train,user_actionable,non_resolution,746
+train,user_actionable,technician_only,180
+valid,non_resolution,technician_only,1
+valid,non_resolution,user_actionable,4
+valid,user_actionable,non_resolution,71
+valid,user_actionable,technician_only,26
+train_valid,non_resolution,technician_only,8
+train_valid,non_resolution,user_actionable,75
+train_valid,user_actionable,non_resolution,817
+train_valid,user_actionable,technician_only,190
